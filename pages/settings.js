@@ -49,6 +49,8 @@ const Settings = () => {
     'entertainment',
     'healthcare',
     'investments',
+    'savings',
+    'other',
   ];
 
   // Helper function to get current month string in consistent format: YYYY-MM-01
@@ -57,23 +59,23 @@ const Settings = () => {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`;
   };
 
-  // Fetch budget settings with fallback to default (month = null)
+  // Use the most recently saved monthly budget as the default for this month.
   const fetchBudgetSettings = async () => {
     try {
-      // Always fetch the default budget (month = null) which persists across months
-      const { data: defaultBudgetData, error: defaultError } = await supabase
+      const currentMonth = getCurrentMonthString();
+      const { data: budgetData, error: budgetError } = await supabase
         .from('monthly_budgets')
         .select('amount')
         .eq('user_id', user.id)
-        .is('month', null)
-        .single();
+        .lte('month', currentMonth)
+        .order('month', { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-      if (defaultError && defaultError.code !== 'PGRST116') {
-        throw defaultError;
-      }
+      if (budgetError) throw budgetError;
 
-      if (defaultBudgetData) {
-        setMonthlyBudget(defaultBudgetData.amount.toString());
+      if (budgetData) {
+        setMonthlyBudget(budgetData.amount.toString());
       } else {
         setMonthlyBudget(''); // No budget set
       }
@@ -192,45 +194,74 @@ const Settings = () => {
     setError('');
     setSuccess('');
     try {
-      // Save monthly budget as default (month = null) so it persists across months
+      const currentMonth = getCurrentMonthString();
       if (monthlyBudget.trim() === '') {
-        // If budget input is empty, delete the default budget
-        await supabase
+        const { error: deleteBudgetError } = await supabase
           .from('monthly_budgets')
           .delete()
-          .match({ user_id: user.id, month: null });
+          .eq('user_id', user.id)
+          .eq('month', currentMonth);
+        if (deleteBudgetError) throw deleteBudgetError;
       } else {
-        // Save as default budget (month = null) to persist across all months
-        await supabase
+        const amount = Number(monthlyBudget);
+        if (!Number.isFinite(amount) || amount < 0) {
+          throw new Error('Enter a valid non-negative monthly budget.');
+        }
+        const { data: existingBudget, error: lookupError } = await supabase
           .from('monthly_budgets')
-          .upsert(
-            [
-              {
-                user_id: user.id,
-                month: null,
-                amount: parseFloat(monthlyBudget) || 0,
-              },
-            ],
-            { onConflict: ['user_id', 'month'] }
-          );
+          .select('amount')
+          .eq('user_id', user.id)
+          .eq('month', currentMonth)
+          .limit(1)
+          .maybeSingle();
+        if (lookupError) throw lookupError;
+
+        const budgetWrite = existingBudget
+          ? supabase
+              .from('monthly_budgets')
+              .update({ amount })
+              .eq('user_id', user.id)
+              .eq('month', currentMonth)
+          : supabase.from('monthly_budgets').insert({
+              user_id: user.id,
+              month: currentMonth,
+              amount,
+            });
+        const { error: budgetWriteError } = await budgetWrite;
+        if (budgetWriteError) throw budgetWriteError;
       }
 
       // Save category limits - no month specific
       const updates = [];
       Object.entries(categoryLimits).forEach(([category, amount]) => {
-        if (amount) {
+        if (amount.trim()) {
+          const limitAmount = Number(amount);
+          if (!Number.isFinite(limitAmount) || limitAmount < 0) {
+            throw new Error(`Enter a valid non-negative limit for ${category}.`);
+          }
           updates.push({
             user_id: user.id,
             category,
-            limit_amount: parseFloat(amount) || 0,
+            limit_amount: limitAmount,
           });
         }
       });
 
       if (updates.length > 0) {
-        await supabase
+        const { error: limitsError } = await supabase
           .from('category_limits')
           .upsert(updates, { onConflict: ['user_id', 'category'] });
+        if (limitsError) throw limitsError;
+      }
+
+      const clearedCategories = categories.filter((category) => !categoryLimits[category]?.trim());
+      if (clearedCategories.length > 0) {
+        const { error: clearLimitsError } = await supabase
+          .from('category_limits')
+          .delete()
+          .eq('user_id', user.id)
+          .in('category', clearedCategories);
+        if (clearLimitsError) throw clearLimitsError;
       }
 
       setSuccess('Settings saved successfully!');
